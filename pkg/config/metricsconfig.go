@@ -1,6 +1,7 @@
 package config
 
 import (
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -77,30 +78,53 @@ func (mcd *metricsConfig) GetBucketBoundaries() []float64 {
 func (mcd *metricsConfig) BuildMeterProviderViews() []sdkmetric.View {
 	mcd.mux.RLock()
 	defer mcd.mux.RUnlock()
-	var views []sdkmetric.View
-	for key, value := range mcd.metricsExposure {
-		if *value.Enabled {
-			views = append(views, sdkmetric.NewView(
-				sdkmetric.Instrument{Name: key},
-				sdkmetric.Stream{
-					AttributeFilter: func(kv attribute.KeyValue) bool {
-						return !slices.Contains(value.DisabledLabelDimensions, string(kv.Key))
-					},
-					Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-						Boundaries: value.BucketBoundaries,
-						NoMinMax:   false,
-					},
-				},
-			))
-		} else if !*value.Enabled {
-			views = append(views, sdkmetric.NewView(
-				sdkmetric.Instrument{Name: key},
-				sdkmetric.Stream{
-					Aggregation: sdkmetric.AggregationDrop{},
-				},
-			))
-		}
+
+	views := []sdkmetric.View{}
+
+	if len(mcd.metricsExposure) > 0 {
+		var metricsExposure = maps.Clone(mcd.metricsExposure)
+		views = append(views, func(i sdkmetric.Instrument) (sdkmetric.Stream, bool) {
+			// Init, clone stream meta
+			s := sdkmetric.Stream{Name: i.Name, Description: i.Description, Unit: i.Unit}
+
+			// Check whether the metric is given with an exposure config
+			config, exists := metricsExposure[i.Name]
+			if !exists {
+				return s, false
+			}
+
+			// Nil check, nil defaults to true
+			if config.Enabled != nil && !*config.Enabled {
+				s.Aggregation = sdkmetric.AggregationDrop{}
+				return s, true
+			}
+
+			// When the config requests an attribute filter
+			if len(config.DisabledLabelDimensions) > 0 {
+				s.AttributeFilter = func(kv attribute.KeyValue) bool {
+					return !slices.Contains(config.DisabledLabelDimensions, string(kv.Key))
+				}
+			}
+
+			// When the config requests custom bucket boundaries
+			if len(config.BucketBoundaries) > 0 {
+				// Grabbing the suggested aggregation type by metic kind
+				aggregation := sdkmetric.DefaultAggregationSelector(i.Kind)
+				// Based on the aggregation implementation
+				switch a := aggregation.(type) {
+				// Configuring a bucket boundary override when the
+				// the aggregation implies a histogram
+				case sdkmetric.AggregationExplicitBucketHistogram:
+					a.Boundaries = config.BucketBoundaries
+					a.NoMinMax = false
+					s.Aggregation = a
+				}
+			}
+
+			return s, true
+		})
 	}
+
 	return views
 }
 
